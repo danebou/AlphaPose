@@ -1,3 +1,4 @@
+from multiprocessing import queues
 import os
 import sys
 from threading import Thread
@@ -19,32 +20,29 @@ class DetectionLoader():
         self.mode = mode
         self.device = opt.device
 
-        if mode == 'image':
-            self.img_dir = opt.inputpath
-            self.imglist = [os.path.join(self.img_dir, im_name.rstrip('\n').rstrip('\r')) for im_name in input_source]
-            self.datalen = len(input_source)
-        elif mode == 'video':
-            stream = cv2.VideoCapture(input_source)
-            assert stream.isOpened(), 'Cannot capture source'
-            self.path = input_source
-            self.datalen = int(stream.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.fourcc = int(stream.get(cv2.CAP_PROP_FOURCC))
-            self.fps = stream.get(cv2.CAP_PROP_FPS)
-            self.frameSize = (int(stream.get(cv2.CAP_PROP_FRAME_WIDTH)), int(stream.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-            self.videoinfo = {'fourcc': self.fourcc, 'fps': self.fps, 'frameSize': self.frameSize}
-            stream.release()
+        # if mode == 'image':
+        #     self.img_dir = opt.inputpath
+        #     self.imglist = [os.path.join(self.img_dir, im_name.rstrip('\n').rstrip('\r')) for im_name in input_source]
+        #     self.datalen = len(input_source)
+        # elif mode == 'video':
+        #     stream = cv2.VideoCapture(input_source)
+        #     assert stream.isOpened(), 'Cannot capture source'
+        #     self.path = input_source
+        #     self.datalen = int(stream.get(cv2.CAP_PROP_FRAME_COUNT))
+        #     self.fourcc = int(stream.get(cv2.CAP_PROP_FOURCC))
+        #     self.fps = stream.get(cv2.CAP_PROP_FPS)
+        #     self.frameSize = (int(stream.get(cv2.CAP_PROP_FRAME_WIDTH)), int(stream.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        #     self.videoinfo = {'fourcc': self.fourcc, 'fps': self.fps, 'frameSize': self.frameSize}
+        #     stream.release()
 
         self.detector = detector
-        self.batchSize = batchSize
-        leftover = 0
-        if (self.datalen) % batchSize:
-            leftover = 1
-        self.num_batches = self.datalen // batchSize + leftover
 
         self._input_size = cfg.DATA_PRESET.IMAGE_SIZE
         self._output_size = cfg.DATA_PRESET.HEATMAP_SIZE
 
         self._sigma = cfg.DATA_PRESET.SIGMA
+
+        self.want_batch = batchSize
 
         pose_dataset = builder.retrieve_dataset(self.cfg.DATASET.TRAIN)
         if cfg.DATA_PRESET.TYPE == 'simple':
@@ -71,6 +69,28 @@ class DetectionLoader():
             self.image_queue = mp.Queue(maxsize=queueSize)
             self.det_queue = mp.Queue(maxsize=10 * queueSize)
             self.pose_queue = mp.Queue(maxsize=10 * queueSize)
+        
+        self.start_queue = mp.Queue(maxsize=queueSize)
+
+    def cont(self, input_source):
+        self.path = input_source
+        stream = cv2.VideoCapture(input_source)
+        assert stream.isOpened(), 'Cannot capture source'
+        self.datalen = int(stream.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fourcc = int(stream.get(cv2.CAP_PROP_FOURCC))
+        self.fps = stream.get(cv2.CAP_PROP_FPS)
+        self.frameSize = (int(stream.get(cv2.CAP_PROP_FRAME_WIDTH)), int(stream.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        self.videoinfo = {'fourcc': self.fourcc, 'fps': self.fps, 'frameSize': self.frameSize}
+        stream.release()
+
+        batchSize = self.want_batch
+
+        self.batchSize = batchSize
+        leftover = 0
+        if (self.datalen) % batchSize:
+            leftover = 1
+        self.num_batches = self.datalen // batchSize + leftover
+        self.wait_and_put(self.start_queue, (self.path, self.batchSize, self.num_batches))
 
     def start_worker(self, target):
         if self.opt.sp:
@@ -109,6 +129,7 @@ class DetectionLoader():
         self.clear(self.image_queue)
         self.clear(self.det_queue)
         self.clear(self.pose_queue)
+        self.clear(self.start_queue)
 
     def clear(self, queue):
         while not queue.empty():
@@ -120,96 +141,65 @@ class DetectionLoader():
     def wait_and_get(self, queue):
         return queue.get()
 
-    def image_preprocess(self):
-        for i in range(self.num_batches):
-            imgs = []
-            orig_imgs = []
-            im_names = []
-            im_dim_list = []
-            for k in range(i * self.batchSize, min((i + 1) * self.batchSize, self.datalen)):
-                if self.stopped:
-                    self.wait_and_put(self.image_queue, (None, None, None, None))
-                    return
-                im_name_k = self.imglist[k]
-
-                # expected image shape like (1,3,h,w) or (3,h,w)
-                img_k = self.detector.image_preprocess(im_name_k)
-                if isinstance(img_k, np.ndarray):
-                    img_k = torch.from_numpy(img_k)
-                # add one dimension at the front for batch if image shape (3,h,w)
-                if img_k.dim() == 3:
-                    img_k = img_k.unsqueeze(0)
-                orig_img_k = cv2.cvtColor(cv2.imread(im_name_k), cv2.COLOR_BGR2RGB) # scipy.misc.imread(im_name_k, mode='RGB') is depreciated
-                im_dim_list_k = orig_img_k.shape[1], orig_img_k.shape[0]
-
-                imgs.append(img_k)
-                orig_imgs.append(orig_img_k)
-                im_names.append(os.path.basename(im_name_k))
-                im_dim_list.append(im_dim_list_k)
-
-            with torch.no_grad():
-                # Human Detection
-                imgs = torch.cat(imgs)
-                im_dim_list = torch.FloatTensor(im_dim_list).repeat(1, 2)
-                # im_dim_list_ = im_dim_list
-
-            self.wait_and_put(self.image_queue, (imgs, orig_imgs, im_names, im_dim_list))
-
     def frame_preprocess(self):
-        stream = cv2.VideoCapture(self.path)
-        assert stream.isOpened(), 'Cannot capture source'
+        while True:
+            self.path, self.batchSize, self.num_batches = self.wait_and_get(self.start_queue)
+            
+            stream = cv2.VideoCapture(self.path)
+            assert stream.isOpened(), 'Cannot capture source'
+            self.datalen = int(stream.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        for i in range(self.num_batches):
-            imgs = []
-            orig_imgs = []
-            im_names = []
-            im_dim_list = []
-            for k in range(i * self.batchSize, min((i + 1) * self.batchSize, self.datalen)):
-                (grabbed, frame) = stream.read()
-                # if the `grabbed` boolean is `False`, then we have
-                # reached the end of the video file
-                if not grabbed or self.stopped:
-                    # put the rest pre-processed data to the queue
-                    if len(imgs) > 0:
-                        with torch.no_grad():
-                            # Record original image resolution
-                            imgs = torch.cat(imgs)
-                            im_dim_list = torch.FloatTensor(im_dim_list).repeat(1, 2)
-                        self.wait_and_put(self.image_queue, (imgs, orig_imgs, im_names, im_dim_list))
-                    self.wait_and_put(self.image_queue, (None, None, None, None))
-                    print('===========================> This video get ' + str(k) + ' frames in total.')
-                    sys.stdout.flush()
-                    stream.release()
-                    return
+            for i in range(self.num_batches):
+                imgs = []
+                orig_imgs = []
+                im_names = []
+                im_dim_list = []
+                for k in range(i * self.batchSize, min((i + 1) * self.batchSize, self.datalen)):
+                    (grabbed, frame) = stream.read()
+                    # if the `grabbed` boolean is `False`, then we have
+                    # reached the end of the video file
+                    if not grabbed or self.stopped:
+                        # put the rest pre-processed data to the queue
+                        if len(imgs) > 0:
+                            with torch.no_grad():
+                                # Record original image resolution
+                                imgs = torch.cat(imgs)
+                                im_dim_list = torch.FloatTensor(im_dim_list).repeat(1, 2)
+                            self.wait_and_put(self.image_queue, (imgs, orig_imgs, im_names, im_dim_list))
+                        self.wait_and_put(self.image_queue, (None, None, None, None))
+                        print('===========================> This video get ' + str(k) + ' frames in total.')
+                        sys.stdout.flush()
+                        stream.release()
+                        return
 
-                # expected frame shape like (1,3,h,w) or (3,h,w)
-                img_k = self.detector.image_preprocess(frame)
+                    # expected frame shape like (1,3,h,w) or (3,h,w)
+                    img_k = self.detector.image_preprocess(frame)
 
-                if isinstance(img_k, np.ndarray):
-                    img_k = torch.from_numpy(img_k)
-                # add one dimension at the front for batch if image shape (3,h,w)
-                if img_k.dim() == 3:
-                    img_k = img_k.unsqueeze(0)
+                    if isinstance(img_k, np.ndarray):
+                        img_k = torch.from_numpy(img_k)
+                    # add one dimension at the front for batch if image shape (3,h,w)
+                    if img_k.dim() == 3:
+                        img_k = img_k.unsqueeze(0)
 
-                im_dim_list_k = frame.shape[1], frame.shape[0]
+                    im_dim_list_k = frame.shape[1], frame.shape[0]
 
-                imgs.append(img_k)
-                orig_imgs.append(frame[:, :, ::-1])
-                im_names.append(str(k) + '.jpg')
-                im_dim_list.append(im_dim_list_k)
+                    imgs.append(img_k)
+                    orig_imgs.append(frame[:, :, ::-1])
+                    im_names.append(str(k) + '.jpg')
+                    im_dim_list.append(im_dim_list_k)
 
-            with torch.no_grad():
-                # Record original image resolution
-                imgs = torch.cat(imgs)
-                im_dim_list = torch.FloatTensor(im_dim_list).repeat(1, 2)
-                # im_dim_list_ = im_dim_list
+                with torch.no_grad():
+                    # Record original image resolution
+                    imgs = torch.cat(imgs)
+                    im_dim_list = torch.FloatTensor(im_dim_list).repeat(1, 2)
+                    # im_dim_list_ = im_dim_list
 
-            self.wait_and_put(self.image_queue, (imgs, orig_imgs, im_names, im_dim_list))
-        stream.release()
+                self.wait_and_put(self.image_queue, (imgs, orig_imgs, im_names, im_dim_list, self.batchSize))
+            stream.release()
 
     def image_detection(self):
-        for i in range(self.num_batches):
-            imgs, orig_imgs, im_names, im_dim_list = self.wait_and_get(self.image_queue)
+        while True:
+            imgs, orig_imgs, im_names, im_dim_list, self.batchSize = self.wait_and_get(self.image_queue)
             if imgs is None or self.stopped:
                 self.wait_and_put(self.det_queue, (None, None, None, None, None, None, None))
                 return
@@ -246,7 +236,7 @@ class DetectionLoader():
                 self.wait_and_put(self.det_queue, (orig_imgs[k], im_names[k], boxes_k, scores[dets[:, 0] == k], ids[dets[:, 0] == k], inps, cropped_boxes))
 
     def image_postprocess(self):
-        for i in range(self.datalen):
+        while True:
             with torch.no_grad():
                 (orig_img, im_name, boxes, scores, ids, inps, cropped_boxes) = self.wait_and_get(self.det_queue)
                 if orig_img is None or self.stopped:
@@ -262,7 +252,6 @@ class DetectionLoader():
                     cropped_boxes[i] = torch.FloatTensor(cropped_box)
 
                 # inps, cropped_boxes = self.transformation.align_transform(orig_img, boxes)
-
                 self.wait_and_put(self.pose_queue, (inps, orig_img, im_name, boxes, scores, ids, cropped_boxes))
 
     def read(self):

@@ -100,7 +100,7 @@ class DataWriter():
                 # if the thread indicator variable is set (img is None), stop the thread
                 if self.save_video:
                     stream.release()
-                write_json(final_result, self.opt.outputpath, form=self.opt.format, for_eval=self.opt.eval)
+                write_json(final_result, '', form=self.opt.format, for_eval=self.opt.eval,outputfile=self.opt.outputpath)
                 print("Results have been written to json.")
                 return
             # image channel RGB->BGR
@@ -153,7 +153,7 @@ class DataWriter():
                             'kp_score':preds_scores[k],
                             'proposal_score': torch.mean(preds_scores[k]) + scores[k] + 1.25 * max(preds_scores[k]),
                             'idx':ids[k],
-                            'box':[boxes[k][0], boxes[k][1], boxes[k][2]-boxes[k][0],boxes[k][3]-boxes[k][1]] 
+                            'box':[boxes[k][0], boxes[k][1], boxes[k][2]-boxes[k][0],boxes[k][3]-boxes[k][1]]
                         }
                     )
 
@@ -217,7 +217,7 @@ class DataWriter():
 
     def clear_queues(self):
         self.clear(self.result_queue)
-        
+
     def clear(self, queue):
         while not queue.empty():
             queue.get()
